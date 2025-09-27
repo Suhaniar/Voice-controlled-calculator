@@ -1,0 +1,552 @@
+# app.py
+import streamlit as st
+import speech_recognition as sr
+import pyttsx3
+import re
+import threading
+import operator
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import io
+from gtts import gTTS
+from langdetect import detect
+import os
+import sympy as sp
+
+# Optional OpenAI — used only if you set OPENAI_API_KEY env var
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+# -------------------------
+# Configuration / Helpers
+# -------------------------
+st.set_page_config(page_title="Advanced Voice Calculator", layout="wide")
+st.title("🎤 Advanced Voice-Controlled Calculator (Internship-level)")
+
+# initialize TTS engine (English offline)
+py_engine = pyttsx3.init()
+py_engine.setProperty('rate', 150)
+py_engine.setProperty('volume', 1.0)
+voices = py_engine.getProperty('voices')
+# pick a female voice if available (fallback is fine)
+if len(voices) > 1:
+    py_engine.setProperty('voice', voices[1].id)
+
+def speak_local(text):
+    """Use pyttsx3 to speak (English/local offline). Called in thread to avoid blocking."""
+    try:
+        py_engine.say(str(text))
+        py_engine.runAndWait()
+    except RuntimeError:
+        pass
+
+def speak_gtts(text, lang="hi"):
+    """Use gTTS to generate audio and return raw bytes for Streamlit audio player."""
+    try:
+        tts = gTTS(text=str(text), lang=lang)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        return None
+
+def speak(text):
+    """
+    Unified speak function:
+     - If text detected as Hindi (Devanagari or language detection), use gTTS and play.
+     - Else use pyttsx3.
+    We run pyttsx3 in a separate thread to avoid Streamlit blocking.
+    """
+    # naive detection for Devanagari script
+    if re.search(r'[\u0900-\u097F]', text):
+        audio_bytes = speak_gtts(text, lang="hi")
+        if audio_bytes:
+            # stream audio in streamlit — but here we prefer asynchronous pyttsx3 fallback
+            # return audio bytes to be played in UI if desired
+            return audio_bytes
+    # default: pyttsx3 speak asynchronously
+    threading.Thread(target=speak_local, args=(text,), daemon=True).start()
+    return None
+
+# -------------------------
+# Session state init
+# -------------------------
+if "history" not in st.session_state:
+    st.session_state.history = []  # list of dicts: {"command":..., "result":..., "steps": [...]}
+if "memory" not in st.session_state:
+    st.session_state.memory = {}   # variable memory
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "openai_checked" not in st.session_state:
+    st.session_state.openai_checked = False
+
+# If user wants to enable OpenAI, read API key from env or input
+openai_api_key = None
+if OPENAI_AVAILABLE:
+    if not st.session_state.openai_checked:
+        # Check if env var exists
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        st.session_state.openai_checked = True
+    else:
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+
+# Optional small UI to inform about OpenAI usage
+with st.expander("Optional: AI/NLP (OpenAI) — improves parsing of complex sentences", expanded=False):
+    st.write("If you set an environment variable `OPENAI_API_KEY`, the app will use OpenAI to help translate tricky natural-language math instructions into a stable expression. This is optional — the app will still function without it.")
+    st.write("To set locally: `export OPENAI_API_KEY='your_key'` (Linux/mac) or set in your environment variables in Windows.")
+    if OPENAI_AVAILABLE:
+        st.success("openai library is available")
+    else:
+        st.info("openai python package not installed — install to enable AI parsing")
+
+# -------------------------
+# KEEP YOUR ORIGINAL listen_command BODY (with minor robustness)
+# -------------------------
+def listen_command():
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        st.info("🎙️ Listening... (please speak clearly)")
+        r.adjust_for_ambient_noise(source, duration=0.8)
+        try:
+            audio = r.listen(source, timeout=5, phrase_time_limit=12)
+        except sr.WaitTimeoutError:
+            return "Timeout: No speech detected."
+        try:
+            text = r.recognize_google(audio)
+            return text
+        except sr.UnknownValueError:
+            return "Sorry, I could not understand the audio."
+        except sr.RequestError:
+            return "Network error."
+
+# -------------------------
+# Word-to-number converter (keeps original)
+# -------------------------
+def word_to_number(command):
+    word_to_num = {
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14",
+        "fifteen": "15", "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19",
+        "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50",
+        "sixty": "60", "seventy": "70", "eighty": "80", "ninety": "90",
+        "hundred": "100", "thousand": "1000"
+    }
+
+    tokens = command.split()
+    converted = []
+
+    for word in tokens:
+        if word in word_to_num:
+            converted.append(word_to_num[word])
+        else:
+            converted.append(word)
+
+    return " ".join(converted)
+
+# -------------------------
+# AI helper: ask OpenAI to convert natural language -> simplified expression
+# -------------------------
+def openai_parse_to_steps(text):
+    """
+    Use OpenAI to transform a natural sentence into a 'then'-separated, token-friendly pseudo-command.
+    Example:
+      "Add 5 to the previous result, then multiply by 3"
+    -> "it add 5 then multiply 3"
+    This is used only as fallback or optionally to improve parsing.
+    """
+    if not OPENAI_AVAILABLE:
+        return text  # no change
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return text
+    try:
+        openai.api_key = api_key
+        prompt = (
+            "You are a transformer that rewrites English math instructions into a small-step, "
+            "token-friendly sequence separated by the word 'then'. "
+            "Use operator words: add, subtract, multiply, divide, sqrt, cbrt, sin, cos, tan, log, ln, fact, emi. "
+            "Use 'it' or 'result' to refer to previous result. Use 'set x to 5' for assignments. "
+            "Keep numbers as numeric values. Examples:\n"
+            "\"Add 5 and 3 then multiply by 2\" -> \"5 add 3 then multiply 2\"\n"
+            "\"Set x to 10 then add x and 5\" -> \"set x to 10 then x add 5\"\n"
+            f"Rewrite the following instruction similarly:\n\"{text}\"\n\nOutput only the rewritten command."
+        )
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",  # use any available model; user may change
+            messages=[{"role":"system","content":"You rewrite math instructions only."},
+                      {"role":"user","content":prompt}],
+            max_tokens=256,
+            temperature=0.0
+        )
+        out = resp.choices[0].message.content.strip()
+        # sometimes model outputs backticks or explanation; extract first line if needed
+        if out:
+            # remove surrounding quotes/backticks if present
+            out = out.strip('`" ')
+            return out
+        return text
+    except Exception:
+        return text
+
+# -------------------------
+# Core parsing/evaluation function (enhanced but keeps your structure)
+# -------------------------
+def multiline(command, try_ai=True):
+    """
+    This function is the upgraded version of your multiline parser:
+      - keeps original replacements and step-splitting by 'then'
+      - adds variable memory, context awareness (it/result -> last), advanced unary ops, finance ops, unit conversions
+      - optionally uses OpenAI to rewrite tricky natural sentences into step format (see openai_parse_to_steps)
+    Returns (list_of_step_strings, final_result)
+    """
+    # attempt AI rewriting first for complex sentences if available
+    if try_ai and OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
+        # only call when the instruction looks complex (commas, "then", or words like "calculate", "what is")
+        if len(command.split()) > 6:
+            rewritten = openai_parse_to_steps(command)
+            # if rewrite is reasonable length and contains keywords, use it
+            if rewritten and rewritten != command:
+                command = rewritten
+
+    # preserve original case-insensitive
+    command = command.lower().strip()
+    # convert common words to operator tokens
+    command = command.replace("into", " multiply ")
+    command = re.sub(r'\bx\b', " multiply ", command)  # standalone x -> multiply
+    command = command.replace("multiplied by", " multiply ")
+    command = command.replace("multiply by", " multiply ")
+    command = command.replace("/", " divide ")
+    command = command.replace("+", " add ")
+    command = command.replace("-", " subtract ")
+    command = command.replace("divided by", " divide ")
+    command = command.replace("square root", " sqrt ")
+    command = command.replace("cube root", " cbrt ")
+    command = command.replace("percent", "%")
+    command = command.replace("%", " percent ")
+    # convert words like "percent of 500" to "percent 5 00"? We'll handle percent with regex later.
+
+    # convert number words to digits (simple)
+    command = word_to_number(command)
+
+    # context words -> replace with last_result if available
+    if "it" in command or "result" in command or "previous" in command:
+        lr = st.session_state.last_result
+        if lr is not None:
+            # careful: replace words it/result/previous with the numeric last result string
+            command = re.sub(r'\b(it|result|previous|previously)\b', str(lr), command)
+        else:
+            command = re.sub(r'\b(it|result|previous|previously)\b', "0", command)
+
+    # split into steps on 'then' or comma+then-like
+    steps_raw = re.split(r'\bthen\b|, then|, and then|;|,', command)
+    steps = [s.strip() for s in steps_raw if s.strip()]
+
+    op_map = {
+        "add": operator.add,
+        "subtract": operator.sub,
+        "multiply": operator.mul,
+        "divide": operator.truediv
+    }
+
+    unary_ops = {
+        "square": lambda x: x ** 2,
+        "cube": lambda x: x ** 3,
+        "sqrt": lambda x: round(x ** 0.5, 6),
+        "cbrt": lambda x: round(x ** (1.0 / 3.0), 6),
+        "sin": lambda x: round(math.sin(math.radians(x)), 6),
+        "cos": lambda x: round(math.cos(math.radians(x)), 6),
+        "tan": lambda x: round(math.tan(math.radians(x)), 6),
+        "asin": lambda x: round(math.degrees(math.asin(x)), 6),
+        "acos": lambda x: round(math.degrees(math.acos(x)), 6),
+        "atan": lambda x: round(math.degrees(math.atan(x)), 6),
+        "log": lambda x: round(math.log10(x), 6),
+        "ln": lambda x: round(math.log(x), 6),
+        "fact": lambda x: math.factorial(int(x))
+    }
+
+    results_steps = []
+    local_last = None
+
+    for step in steps:
+        tokens = step.split()
+        values = []
+        ops = []
+
+        # handle 'set <var> to <value>' (assignment)
+        if "set" in tokens and "to" in tokens:
+            try:
+                var_idx = tokens.index("set") + 1
+                var_name = tokens[var_idx]
+                to_idx = tokens.index("to") + 1
+                # if RHS is expression, attempt sympy eval
+                rhs_tokens = tokens[to_idx:]
+                rhs = " ".join(rhs_tokens)
+                # convert percent e.g., 20% of 200 -> we'll manage percent elsewhere
+                try:
+                    # try numeric conversion first
+                    val = float(rhs)
+                except:
+                    # fallback: sympy evaluation
+                    try:
+                        val = float(sp.sympify(rhs).evalf())
+                    except Exception:
+                        val = 0.0
+                st.session_state.memory[var_name] = val
+                local_last = val
+                results_steps.append(f"Step: '{step}' => {var_name} set to {val}")
+                continue
+            except Exception as e:
+                results_steps.append(f"Step: '{step}' => Assignment error: {e}")
+                continue
+
+        # detect finance patterns: EMI, compound interest, simple interest
+        if re.search(r'\bemi\b', step):
+            # try to extract principal, rate, time
+            try:
+                P = float(re.search(r'principal\s*([0-9]+(?:\.[0-9]+)?)', step).group(1))
+                R = float(re.search(r'rate\s*([0-9]+(?:\.[0-9]+)?)', step).group(1)) / 100.0 / 12.0
+                T = float(re.search(r'time\s*([0-9]+(?:\.[0-9]+)?)', step).group(1)) * 12.0
+                emi = P * R * (1 + R) ** T / ((1 + R) ** T - 1)
+                local_last = round(emi, 6)
+                results_steps.append(f"Step: '{step}' => EMI = {round(emi,2)}")
+                # create amortization data to visualize later (store in memory)
+                months = int(T)
+                bal = P
+                schedule = []
+                for m in range(1, months + 1):
+                    interest = bal * R
+                    principal_paid = emi - interest
+                    bal -= principal_paid
+                    schedule.append((m, round(emi, 2), round(principal_paid, 2), round(interest, 2), round(max(bal, 0), 2)))
+                st.session_state.memory["_last_emi_schedule"] = schedule
+                continue
+            except Exception as e:
+                results_steps.append(f"Step: '{step}' => EMI calc failed: {e}")
+                continue
+
+        # compound interest pattern: "compound interest on 1000 rate 5 time 2"
+        if re.search(r'compound interest', step):
+            try:
+                P = float(re.search(r'on\s*([0-9]+(?:\.[0-9]+)?)', step).group(1))
+                r = float(re.search(r'rate\s*([0-9]+(?:\.[0-9]+)?)', step).group(1))/100.0
+                t = float(re.search(r'time\s*([0-9]+(?:\.[0-9]+)?)', step).group(1))
+                n_match = re.search(r'compounded\s*([0-9]+)', step)
+                n = int(n_match.group(1)) if n_match else 1
+                A = P * (1 + r/n) ** (n * t)
+                local_last = round(A, 6)
+                results_steps.append(f"Step: '{step}' => Compound amount = {round(A, 2)}")
+                continue
+            except Exception as e:
+                results_steps.append(f"Step: '{step}' => Compound interest failed: {e}")
+                continue
+
+        # simple token classification: numbers, memory vars, ops, unary ops
+        for word in tokens:
+            if word in op_map:
+                ops.append(word)
+            elif word in unary_ops:
+                ops.append(word)
+            elif re.match(r'^-?\d+\.?\d*$', word):
+                # numeric token
+                values.append(float(word) if '.' in word else int(word))
+            elif word in st.session_state.memory:
+                values.append(st.session_state.memory[word])
+            # handle percent: "20 percent of 500" => 0.2 * 500; we handle below if detected
+
+        # percent handling
+        if "percent" in tokens and "of" in tokens:
+            # find pattern: <p> percent of <value>
+            try:
+                m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*percent\s*of\s*([0-9]+(?:\.[0-9]+)?)', step)
+                if m:
+                    p = float(m.group(1))
+                    val = float(m.group(2))
+                    res = (p/100.0) * val
+                    local_last = round(res, 6)
+                    results_steps.append(f"Step: '{step}' => {p}% of {val} = {round(res,6)}")
+                    continue
+            except:
+                pass
+
+        # if no numeric values but last exists, use last as input
+        if not values and st.session_state.last_result is not None:
+            values = [st.session_state.last_result]
+
+        if not values:
+            # try to evaluate entire step with sympy for expressions like "5+3*2"
+            try:
+                # replace common words with sympy-friendly tokens
+                expr = step.replace('add', '+').replace('subtract', '-').replace('multiply', '*').replace('divide', '/')
+                expr = expr.replace('^', '**')
+                val = float(sp.sympify(expr).evalf())
+                local_last = val
+                results_steps.append(f"Step: '{step}' => Result: {round(val,6)}")
+                continue
+            except Exception as e:
+                results_steps.append(f"Step: '{step}' => Result: Invalid input")
+                continue
+
+        # compute using ops and values
+        try:
+            # unary op first if ops[0] is unary
+            if ops and ops[0] in unary_ops and len(values) >= 1:
+                res = unary_ops[ops[0]](float(values[0]))
+            else:
+                res = float(values[0])
+                for i in range(len(ops)):
+                    if i+1 < len(values):
+                        res = op_map[ops[i]](res, float(values[i+1]))
+                    else:
+                        # attempt to use last_result as RHS
+                        rhs = st.session_state.last_result if st.session_state.last_result is not None else 0
+                        res = op_map[ops[i]](res, float(rhs))
+            res = round(res, 6)
+            local_last = res
+            results_steps.append(f"Step: '{step}' => Result: {res}")
+        except Exception as e:
+            results_steps.append(f"Step: '{step}' => Error: {e}")
+            local_last = "Error"
+
+    # update global last_result
+    st.session_state.last_result = local_last
+    return results_steps, local_last
+
+# -------------------------
+# Visualization helpers
+# -------------------------
+def plot_emi_schedule(schedule):
+    """
+    schedule: list of tuples (month, emi, principal_paid, interest, balance)
+    """
+    if not schedule:
+        st.info("No EMI schedule available.")
+        return
+    df = pd.DataFrame(schedule, columns=["Month","EMI","Principal","Interest","Balance"])
+    fig, ax = plt.subplots(figsize=(8,4))
+    ax.plot(df["Month"], df["Balance"], marker='o')
+    ax.set_title("Outstanding Balance over Months")
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Balance")
+    ax.grid(True)
+    st.pyplot(fig)
+    st.dataframe(df.head(12))  # show first year rows
+
+# -------------------------
+# UI Layout (keeps your original button & flow)
+# -------------------------
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    if st.button("🎙️ Start Listening", use_container_width=True):
+        with st.spinner("🎧 Listening... Please speak your query."):
+            user_text = listen_command()
+
+        st.subheader("🗣️ You said:")
+        st.info(user_text)
+
+        if "sorry" not in user_text.lower() and "timeout" not in user_text.lower() and "network error" not in user_text.lower():
+            with st.spinner("🧮 Calculating..."):
+                # main call: we allow AI parse fallback if available
+                steps, final_result = multiline(user_text, try_ai=True)
+
+            st.markdown("### 📘 Step-by-step Calculation:")
+            for s in steps:
+                st.text(s)
+
+            # Final output
+            try:
+                display_value = final_result if final_result is not None else "No numeric result"
+            except:
+                display_value = "No numeric result"
+
+            st.markdown(f"<h3 style='color: green;'>✅ Final Result: {display_value}</h3>", unsafe_allow_html=True)
+
+            # Add to session history
+            st.session_state.history.append({"command": user_text, "result": display_value, "steps": steps})
+
+            # Show history (last 10)
+            st.markdown("### 🕒 Calculation History (last 10):")
+            hist_df = pd.DataFrame(st.session_state.history[-10:])
+            # present compact view
+            if not hist_df.empty:
+                hist_display = hist_df[["command","result"]].rename(columns={"command":"Command","result":"Result"})
+                st.dataframe(hist_display, use_container_width=True)
+
+            # Offer downloads: CSV and Excel
+            if st.button("📥 Download History as CSV"):
+                buf = io.StringIO()
+                pd.DataFrame(st.session_state.history).to_csv(buf, index=False)
+                st.download_button("Click to download CSV", data=buf.getvalue(), file_name="calc_history.csv", mime="text/csv")
+
+            if st.button("📥 Download History as Excel"):
+                buf = io.BytesIO()
+                pd.DataFrame(st.session_state.history).to_excel(buf, index=False, engine="openpyxl")
+                buf.seek(0)
+                st.download_button("Click to download Excel", data=buf, file_name="calc_history.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            # If EMI schedule available, show plot
+            schedule = st.session_state.memory.get("_last_emi_schedule", None)
+            if schedule:
+                st.markdown("### 📊 EMI Amortization (visual):")
+                plot_emi_schedule(schedule)
+
+            # speak the result: if Hindi detected in original text prefer Hindi audio
+            try:
+                # detect language of user_text
+                lang = "en"
+                try:
+                    lang = detect(user_text)
+                except:
+                    lang = "en"
+                if lang.startswith("hi") or re.search(r'[\u0900-\u097F]', user_text):
+                    audio_bytes = speak_gtts(f"अंतिम परिणाम {display_value}", lang="hi")
+                    if audio_bytes:
+                        st.audio(audio_bytes, format="audio/mp3")
+                    else:
+                        speak(f"The final result is {display_value}")
+                else:
+                    # speak using pyttsx3 asynchronously
+                    speak(f"The final result is {display_value}")
+            except Exception:
+                speak(f"The final result is {display_value}")
+        else:
+            st.error("❌ Could not understand your command. Please try again.")
+
+# -------------------------
+# Extra UI: manual input & quick examples
+# -------------------------
+st.markdown("---")
+st.markdown("### Or type a command manually (examples):")
+example_cmd = st.text_input("Type command (e.g., '5 add 3 then multiply 2', 'set x to 10 then x multiply 5', 'EMI principal 50000 rate 7 time 2')")
+
+if st.button("Calculate typed command"):
+    if example_cmd.strip():
+        steps, final_result = multiline(example_cmd, try_ai=False)
+        st.markdown("### 📘 Step-by-step Calculation:")
+        for s in steps:
+            st.text(s)
+        st.markdown(f"<h3 style='color: green;'>✅ Final Result: {final_result}</h3>", unsafe_allow_html=True)
+        st.session_state.history.append({"command": example_cmd, "result": final_result, "steps": steps})
+        # speak
+        speak(f"The final result is {final_result}")
+
+# -------------------------
+# Footer: quick tips
+# -------------------------
+st.markdown("---")
+st.markdown("""
+**Tips & supported patterns**
+- Multi-step: say `then` between steps: "5 add 3 then multiply 2".  
+- Assignment: "set x to 10", then "x multiply 5".  
+- Trig: "sin 30", "cos 45".  
+- Log: "log 100", "ln 2.718".  
+- EMI: "EMI principal 50000 rate 7 time 2" (time in years).  
+- Percent: "20 percent of 500".  
+- Natural sentences are accepted; if parsing is tricky and you have OPENAI_API_KEY set, the app will use AI to rewrite into steps.
+""")
